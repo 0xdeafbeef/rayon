@@ -9,3 +9,14 @@ Please see [Rayon Docs] for details about using Rayon.
 [Rayon Docs]: https://docs.rs/rayon/
 
 Rayon-core currently requires `rustc 1.80.0` or greater.
+
+## Scheduler metrics
+
+`ThreadPoolBuilder::metrics_recorder` exposes coarse scheduler events such as
+`StartLooking`, `WorkFound`, `Sleeping`, and `Resumed`. Each callback carries an
+`Instant` timestamp, the emitting pool identifier, optional search/sleep latency
+measurements, and monotonic per-worker spawn counters for both LIFO and FIFO
+tasks. `ThreadPoolBuilder::metrics_events` accepts any `WorkerEventSet` (or
+values that convert into one) to filter out unneeded transitions. Recorder
+panics are caught so instrumentation cannot crash the pool, and disabling
+recording keeps the hot path unchanged.

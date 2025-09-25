@@ -1,6 +1,6 @@
 use crate::job::{JobFifo, JobRef, StackJob};
 use crate::latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch, SpinLatch};
-use crate::sleep::Sleep;
+use crate::sleep::{Sleep, SpawnKind};
 use crate::sync::Mutex;
 use crate::unwind;
 use crate::{
@@ -14,7 +14,7 @@ use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
 
@@ -54,7 +54,8 @@ impl ThreadBuilder {
 impl fmt::Debug for ThreadBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ThreadBuilder")
-            .field("pool", &self.registry.id())
+            .field("pool", &self.registry.pool_id())
+            .field("registry", &self.registry.id())
             .field("index", &self.index)
             .field("name", &self.name)
             .field("stack_size", &self.stack_size)
@@ -128,7 +129,9 @@ where
 pub(super) struct Registry {
     thread_infos: Vec<ThreadInfo>,
     sleep: Sleep,
+    pool_id: u64,
     injected_jobs: Injector<JobRef>,
+    inject_depth: AtomicUsize,
     broadcasts: Mutex<Vec<Worker<JobRef>>>,
     panic_handler: Option<Box<PanicHandler>>,
     start_handler: Option<Box<StartHandler>>,
@@ -155,6 +158,7 @@ pub(super) struct Registry {
 
 static mut THE_REGISTRY: Option<Arc<Registry>> = None;
 static THE_REGISTRY_SET: Once = Once::new();
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Starts the worker threads (if that has not already happened). If
 /// initialization has not already occurred, use the default
@@ -268,10 +272,16 @@ impl Registry {
             })
             .unzip();
 
+        let metrics_recorder = builder.take_metrics_recorder();
+        let pool_id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
+        let events = builder.metrics_event_filter();
+
         let registry = Arc::new(Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
-            sleep: Sleep::new(n_threads),
+            sleep: Sleep::new(n_threads, pool_id, events, metrics_recorder.clone()),
+            pool_id,
             injected_jobs: Injector::new(),
+            inject_depth: AtomicUsize::new(0),
             broadcasts: Mutex::new(broadcasts),
             terminate_count: AtomicUsize::new(1),
             panic_handler: builder.take_panic_handler(),
@@ -368,6 +378,10 @@ impl Registry {
         }
     }
 
+    pub(super) fn pool_id(&self) -> u64 {
+        self.pool_id
+    }
+
     pub(super) fn num_threads(&self) -> usize {
         self.thread_infos.len()
     }
@@ -439,6 +453,7 @@ impl Registry {
 
         let queue_was_empty = self.injected_jobs.is_empty();
 
+        self.inject_depth.fetch_add(1, Ordering::AcqRel);
         self.injected_jobs.push(injected_job);
         self.sleep.new_injected_jobs(1, queue_was_empty);
     }
@@ -450,7 +465,11 @@ impl Registry {
     fn pop_injected_job(&self) -> Option<JobRef> {
         loop {
             match self.injected_jobs.steal() {
-                Steal::Success(job) => return Some(job),
+                Steal::Success(job) => {
+                    let depth = self.inject_depth.fetch_sub(1, Ordering::AcqRel);
+                    debug_assert!(depth > 0, "inject_depth underflow");
+                    return Some(job);
+                }
                 Steal::Empty => return None,
                 Steal::Retry => {}
             }
@@ -726,14 +745,21 @@ impl WorkerThread {
 
     #[inline]
     pub(super) unsafe fn push(&self, job: JobRef) {
-        let queue_was_empty = self.worker.is_empty();
-        self.worker.push(job);
-        self.registry.sleep.new_internal_jobs(1, queue_was_empty);
+        self.push_with_kind(job, SpawnKind::Lifo);
     }
 
     #[inline]
     pub(super) unsafe fn push_fifo(&self, job: JobRef) {
-        self.push(self.fifo.push(job));
+        let job = self.fifo.push(job);
+        self.push_with_kind(job, SpawnKind::Fifo);
+    }
+
+    #[inline]
+    unsafe fn push_with_kind(&self, job: JobRef, kind: SpawnKind) {
+        self.registry.sleep.record_spawn(self.index, kind);
+        let queue_was_empty = self.worker.is_empty();
+        self.worker.push(job);
+        self.registry.sleep.new_internal_jobs(1, queue_was_empty);
     }
 
     #[inline]
@@ -793,10 +819,22 @@ impl WorkerThread {
                 continue;
             }
 
-            let mut idle_state = self.registry.sleep.start_looking(self.index);
+            let local_queue_depth = self.worker.len();
+            let global_queue_depth = self.registry.inject_depth.load(Ordering::Acquire);
+            let mut idle_state = self.registry.sleep.start_looking(
+                self.index,
+                Some(local_queue_depth),
+                Some(global_queue_depth),
+            );
             while !latch.probe() {
                 if let Some(job) = self.find_work() {
-                    self.registry.sleep.work_found();
+                    let local_queue_depth = self.worker.len();
+                    let global_queue_depth = self.registry.inject_depth.load(Ordering::Acquire);
+                    self.registry.sleep.work_found(
+                        &mut idle_state,
+                        Some(local_queue_depth),
+                        Some(global_queue_depth),
+                    );
                     self.execute(job);
                     // The job might have injected local work, so go back to the outer loop.
                     continue 'outer;
@@ -809,7 +847,13 @@ impl WorkerThread {
 
             // If we were sleepy, we are not anymore. We "found work" --
             // whatever the surrounding thread was doing before it had to wait.
-            self.registry.sleep.work_found();
+            let local_queue_depth = self.worker.len();
+            let global_queue_depth = self.registry.inject_depth.load(Ordering::Acquire);
+            self.registry.sleep.work_found(
+                &mut idle_state,
+                Some(local_queue_depth),
+                Some(global_queue_depth),
+            );
             break;
         }
 

@@ -66,6 +66,7 @@ use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread;
 
 #[macro_use]
@@ -103,6 +104,185 @@ use std::sync;
 use wasm_sync as sync;
 
 use self::registry::{CustomSpawn, DefaultSpawn, ThreadSpawn};
+use std::time::{Duration, Instant};
+
+/// Receives notifications about scheduler state while a pool runs.
+///
+/// Recorders observe coarse worker lifecycle events. Implementations should be
+/// lightweight, avoid blocking, and ideally remain panic-free. Panics are
+/// caught so that Rayon stays operational, but doing so still disrupts pool
+/// progress and should be treated as a last resort.
+pub trait MetricsRecorder: Send + Sync + 'static {
+    /// Called when a worker transitions between key states or when
+    /// aggregate scheduler counters change.
+    fn worker_event(&self, event: WorkerStateEvent);
+}
+
+impl<T> MetricsRecorder for T
+where
+    T: Fn(WorkerStateEvent) + Send + Sync + 'static,
+{
+    fn worker_event(&self, event: WorkerStateEvent) {
+        (self)(event)
+    }
+}
+
+/// Kind of worker transition that triggered an update.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkerStateKind {
+    /// Worker started searching for work.
+    StartLooking,
+    /// Worker located work and is transitioning to active.
+    WorkFound,
+    /// Worker announced it is sleepy (likely to sleep soon).
+    Sleepy,
+    /// Worker entered the blocked / sleeping state.
+    Sleeping,
+    /// Worker was explicitly woken.
+    Woken,
+    /// Worker resumed execution after completing the blocking wait.
+    Resumed,
+}
+
+impl WorkerStateKind {
+    /// Bit mask covering all defined kinds.
+    pub const ALL_MASK: u64 = (1 << (Self::Resumed as u8 + 1)) - 1;
+
+    /// Returns the bit mask representing this particular kind.
+    pub const fn mask(self) -> u64 {
+        1 << (self as u8)
+    }
+}
+
+/// Describes the subset of [`WorkerStateKind`] transitions that should reach a recorder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct WorkerEventSet {
+    mask: u64,
+}
+
+impl WorkerEventSet {
+    /// Returns a set containing no events.
+    pub const fn empty() -> Self {
+        Self { mask: 0 }
+    }
+
+    /// Returns a set containing every currently-defined event.
+    pub const fn all() -> Self {
+        Self {
+            mask: WorkerStateKind::ALL_MASK,
+        }
+    }
+
+    /// Returns `true` if `kind` is enabled in this set.
+    pub const fn contains(self, kind: WorkerStateKind) -> bool {
+        self.mask & kind.mask() != 0
+    }
+
+    /// Returns the underlying bitmask.
+    pub const fn mask(self) -> u64 {
+        self.mask
+    }
+
+    fn from_iter_internal<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = WorkerStateKind>,
+    {
+        let mut mask = 0;
+        for kind in iter {
+            mask |= kind.mask();
+        }
+        Self {
+            mask: mask & WorkerStateKind::ALL_MASK,
+        }
+    }
+}
+
+impl Default for WorkerEventSet {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl From<WorkerStateKind> for WorkerEventSet {
+    fn from(kind: WorkerStateKind) -> Self {
+        Self { mask: kind.mask() }
+    }
+}
+
+impl From<&[WorkerStateKind]> for WorkerEventSet {
+    fn from(kinds: &[WorkerStateKind]) -> Self {
+        Self::from_iter_internal(kinds.iter().copied())
+    }
+}
+
+impl<const N: usize> From<[WorkerStateKind; N]> for WorkerEventSet {
+    fn from(kinds: [WorkerStateKind; N]) -> Self {
+        Self::from_iter_internal(kinds)
+    }
+}
+
+impl From<Vec<WorkerStateKind>> for WorkerEventSet {
+    fn from(kinds: Vec<WorkerStateKind>) -> Self {
+        Self::from_iter_internal(kinds)
+    }
+}
+
+impl std::iter::FromIterator<WorkerStateKind> for WorkerEventSet {
+    fn from_iter<I: IntoIterator<Item = WorkerStateKind>>(iter: I) -> Self {
+        Self::from_iter_internal(iter)
+    }
+}
+
+impl std::ops::BitOr for WorkerEventSet {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self {
+            mask: (self.mask | rhs.mask) & WorkerStateKind::ALL_MASK,
+        }
+    }
+}
+
+impl std::ops::BitOrAssign for WorkerEventSet {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.mask = (self.mask | rhs.mask) & WorkerStateKind::ALL_MASK;
+    }
+}
+
+/// Snapshot of scheduler counters delivered to [`MetricsRecorder`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerStateEvent {
+    /// Identifier of the pool that emitted the event.
+    pub pool_id: u64,
+    /// Index of the worker associated with this transition.
+    pub worker_index: usize,
+    /// Type of transition that occurred.
+    pub kind: WorkerStateKind,
+    /// Timestamp captured just before invoking the recorder.
+    pub ts: Instant,
+    /// Number of threads currently marked inactive (idle or sleeping).
+    pub inactive_threads: usize,
+    /// Number of inactive threads that are actively sleeping.
+    pub sleeping_threads: usize,
+    /// Number of threads that are awake but idle.
+    pub awake_but_idle_threads: usize,
+    /// Length of the emitting worker's local deque when the event was recorded.
+    pub local_queue_depth: Option<usize>,
+    /// Length of the global injector queue when the event was recorded.
+    pub global_queue_depth: Option<usize>,
+    /// Total number of LIFO spawns registered by this worker since pool start.
+    pub lifo_spawn_count: usize,
+    /// Total number of FIFO spawns registered by this worker since pool start.
+    pub fifo_spawn_count: usize,
+    /// Latency spent searching for work before a `WorkFound` event.
+    pub search_latency: Option<Duration>,
+    /// Time spent blocked while sleeping before a `Resumed` event.
+    pub sleep_duration: Option<Duration>,
+}
 
 /// Returns the maximum number of threads that Rayon supports in a single thread pool.
 ///
@@ -199,6 +379,12 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// "depth-first" fashion. If true, they will do a "breadth-first"
     /// fashion. Depth-first is the default.
     breadth_first: bool,
+
+    /// Optional metrics recorder that observes worker state transitions.
+    metrics_recorder: Option<Arc<dyn MetricsRecorder>>,
+
+    /// Filter describing which worker events reach the recorder.
+    metrics_events: WorkerEventSet,
 }
 
 /// Contains the rayon thread pool configuration. Use [`ThreadPoolBuilder`] instead.
@@ -235,6 +421,8 @@ impl Default for ThreadPoolBuilder {
             exit_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
+            metrics_recorder: None,
+            metrics_events: WorkerEventSet::all(),
         }
     }
 }
@@ -255,6 +443,15 @@ where
     /// Creates a new `ThreadPool` initialized using this configuration.
     pub fn build(self) -> Result<ThreadPool, ThreadPoolBuildError> {
         ThreadPool::build(self)
+    }
+
+    /// Takes and returns the current metrics recorder, leaving `None`.
+    fn take_metrics_recorder(&mut self) -> Option<Arc<dyn MetricsRecorder>> {
+        self.metrics_recorder.take()
+    }
+
+    pub(crate) fn metrics_event_filter(&self) -> WorkerEventSet {
+        self.metrics_events
     }
 
     /// Initializes the global thread pool. This initialization is
@@ -445,6 +642,8 @@ impl<S> ThreadPoolBuilder<S> {
             start_handler: self.start_handler,
             exit_handler: self.exit_handler,
             breadth_first: self.breadth_first,
+            metrics_recorder: self.metrics_recorder,
+            metrics_events: self.metrics_events,
         }
     }
 
@@ -661,6 +860,78 @@ impl<S> ThreadPoolBuilder<S> {
         self.exit_handler = Some(Box::new(exit_handler));
         self
     }
+
+    /// Filters which metrics events are forwarded to the recorder.
+    ///
+    /// Accepts any type convertible into [`WorkerEventSet`], enabling ergonomic
+    /// filters like `WorkerEventSet::from([WorkerStateKind::Sleeping])` or slices
+    /// of [`WorkerStateKind`]. The default forwards every currently-defined
+    /// transition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use rayon_core as rayon;
+    /// use rayon::{ThreadPoolBuilder, WorkerStateKind};
+    ///
+    /// let _pool = ThreadPoolBuilder::new()
+    ///     .metrics_events([WorkerStateKind::WorkFound, WorkerStateKind::Resumed])
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn metrics_events<E>(mut self, events: E) -> Self
+    where
+        E: Into<WorkerEventSet>,
+    {
+        self.metrics_events = events.into();
+        self
+    }
+
+    /// Installs a metrics recorder that observes worker state transitions.
+    ///
+    /// The recorder is invoked with [`WorkerStateEvent`] snapshots that embed an
+    /// `Instant` timestamp, the pool identifier, and optional
+    /// `search_latency`/`sleep_duration` measurements when those values exist
+    /// (`WorkFound` and `Resumed`, respectively). Events also expose the worker's
+    /// current local/global queue depths alongside monotonic FIFO and LIFO spawn
+    /// counters. Implementations should avoid blocking and remain panic-free.
+    /// Rayon catches recorder panics so the pool can continue running, but doing
+    /// so still disrupts progress.
+    ///
+    /// Closures of type `Fn(WorkerStateEvent) + Send + Sync + 'static` implement
+    /// [`MetricsRecorder`], so simple inline loggers are ergonomic:
+    ///
+    /// ```
+    /// # use rayon_core as rayon;
+    /// use rayon::{ThreadPoolBuilder, WorkerStateKind};
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// let resumed = AtomicUsize::new(0);
+    /// let _pool = ThreadPoolBuilder::new()
+    ///     .metrics_recorder(|event| {
+    ///         if event.kind == WorkerStateKind::Resumed {
+    ///             resumed.fetch_add(1, Ordering::Relaxed);
+    ///         }
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn metrics_recorder<R>(mut self, recorder: R) -> Self
+    where
+        R: MetricsRecorder,
+    {
+        self.metrics_recorder = Some(Arc::new(recorder));
+        self
+    }
+
+    /// Sets the metrics recorder using an `Arc` (or any value convertible into one).
+    pub fn metrics_recorder_arc<R>(mut self, recorder: R) -> Self
+    where
+        R: Into<Arc<dyn MetricsRecorder>>,
+    {
+        self.metrics_recorder = Some(recorder.into());
+        self
+    }
 }
 
 #[allow(deprecated)]
@@ -728,6 +999,33 @@ impl Configuration {
         H: Fn(usize) + Send + Sync + 'static,
     {
         self.builder = self.builder.exit_handler(exit_handler);
+        self
+    }
+
+    /// Sets the event mask that filters which worker events reach the recorder.
+    pub fn metrics_events<E>(mut self, events: E) -> Configuration
+    where
+        E: Into<WorkerEventSet>,
+    {
+        self.builder = self.builder.metrics_events(events);
+        self
+    }
+
+    /// Deprecated in favor of `ThreadPoolBuilder::metrics_recorder`.
+    pub fn metrics_recorder<R>(mut self, recorder: R) -> Configuration
+    where
+        R: MetricsRecorder,
+    {
+        self.builder = self.builder.metrics_recorder(recorder);
+        self
+    }
+
+    /// Sets the metrics recorder on the deprecated configuration API using an `Arc`.
+    pub fn metrics_recorder_arc<R>(mut self, recorder: R) -> Configuration
+    where
+        R: Into<Arc<dyn MetricsRecorder>>,
+    {
+        self.builder = self.builder.metrics_recorder_arc(recorder);
         self
     }
 
@@ -800,6 +1098,8 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             ref exit_handler,
             spawn_handler: _,
             ref breadth_first,
+            ref metrics_recorder,
+            ..
         } = *self;
 
         // Just print `Some(<closure>)` or `None` to the debug
@@ -814,6 +1114,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
         let panic_handler = panic_handler.as_ref().map(|_| ClosurePlaceholder);
         let start_handler = start_handler.as_ref().map(|_| ClosurePlaceholder);
         let exit_handler = exit_handler.as_ref().map(|_| ClosurePlaceholder);
+        let metrics_recorder = metrics_recorder.as_ref().map(|_| ClosurePlaceholder);
 
         f.debug_struct("ThreadPoolBuilder")
             .field("num_threads", num_threads)
@@ -824,6 +1125,8 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             .field("start_handler", &start_handler)
             .field("exit_handler", &exit_handler)
             .field("breadth_first", &breadth_first)
+            .field("metrics_events", &self.metrics_events)
+            .field("metrics_recorder", &metrics_recorder)
             .finish()
     }
 }

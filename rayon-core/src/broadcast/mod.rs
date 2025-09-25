@@ -83,7 +83,7 @@ impl<'a> fmt::Debug for BroadcastContext<'a> {
         fmt.debug_struct("BroadcastContext")
             .field("index", &self.index())
             .field("num_threads", &self.num_threads())
-            .field("pool_id", &self.worker.registry().id())
+            .field("pool_id", &self.worker.registry().pool_id())
             .finish()
     }
 }

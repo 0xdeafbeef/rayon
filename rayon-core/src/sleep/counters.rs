@@ -154,13 +154,6 @@ impl AtomicCounters {
             old_value.inactive_threads() > 0,
             "sub_inactive_thread: old_value {old_value:?} has no inactive threads",
         );
-        debug_assert!(
-            old_value.sleeping_threads() <= old_value.inactive_threads(),
-            "sub_inactive_thread: old_value {:?} had {} sleeping threads and {} inactive threads",
-            old_value,
-            old_value.sleeping_threads(),
-            old_value.inactive_threads(),
-        );
 
         // Current heuristic: whenever an inactive thread goes away, if
         // there are any sleeping threads, wake 'em up.
@@ -178,13 +171,6 @@ impl AtomicCounters {
         debug_assert!(
             old_value.sleeping_threads() > 0,
             "sub_sleeping_thread: old_value {old_value:?} had no sleeping threads",
-        );
-        debug_assert!(
-            old_value.sleeping_threads() <= old_value.inactive_threads(),
-            "sub_sleeping_thread: old_value {:?} had {} sleeping threads and {} inactive threads",
-            old_value,
-            old_value.sleeping_threads(),
-            old_value.inactive_threads(),
         );
     }
 
@@ -245,13 +231,15 @@ impl Counters {
 
     #[inline]
     pub(super) fn awake_but_idle_threads(self) -> usize {
+        let inactive = self.inactive_threads();
+        let sleeping = self.sleeping_threads();
         debug_assert!(
-            self.sleeping_threads() <= self.inactive_threads(),
+            sleeping <= inactive,
             "sleeping threads: {} > raw idle threads {}",
-            self.sleeping_threads(),
-            self.inactive_threads()
+            sleeping,
+            inactive
         );
-        self.inactive_threads() - self.sleeping_threads()
+        inactive.saturating_sub(sleeping)
     }
 
     #[inline]

@@ -3,9 +3,13 @@
 
 use crate::latch::CoreLatch;
 use crate::sync::{Condvar, Mutex};
+use crate::{MetricsRecorder, WorkerEventSet, WorkerStateEvent, WorkerStateKind};
 use crossbeam_utils::CachePadded;
-use std::sync::atomic::Ordering;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 mod counters;
 pub(crate) use self::counters::THREADS_MAX;
@@ -24,6 +28,14 @@ pub(super) struct Sleep {
     worker_sleep_states: Vec<CachePadded<WorkerSleepState>>,
 
     counters: AtomicCounters,
+
+    pool_id: u64,
+
+    events: WorkerEventSet,
+
+    metrics: Option<Arc<dyn MetricsRecorder>>,
+
+    spawn_counts: Vec<CachePadded<SpawnCounters>>,
 }
 
 /// An instance of this struct is created when a thread becomes idle.
@@ -41,6 +53,8 @@ pub(super) struct IdleState {
     /// Once we become sleepy, what was the sleepy counter value?
     /// Set to `INVALID_SLEEPY_COUNTER` otherwise.
     jobs_counter: JobsEventCounter,
+
+    search_started_at: Instant,
 }
 
 /// The "sleep state" for an individual worker.
@@ -56,32 +70,160 @@ struct WorkerSleepState {
 const ROUNDS_UNTIL_SLEEPY: u32 = 32;
 const ROUNDS_UNTIL_SLEEPING: u32 = ROUNDS_UNTIL_SLEEPY + 1;
 
+struct SpawnCounters {
+    lifo: AtomicUsize,
+    fifo: AtomicUsize,
+}
+
+impl SpawnCounters {
+    fn new() -> Self {
+        Self {
+            lifo: AtomicUsize::new(0),
+            fifo: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SpawnKind {
+    Lifo,
+    Fifo,
+}
+
 impl Sleep {
-    pub(super) fn new(n_threads: usize) -> Sleep {
+    pub(super) fn new(
+        n_threads: usize,
+        pool_id: u64,
+        events: WorkerEventSet,
+        metrics: Option<Arc<dyn MetricsRecorder>>,
+    ) -> Sleep {
         assert!(n_threads <= THREADS_MAX);
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| Default::default()).collect(),
             counters: AtomicCounters::new(),
+            pool_id,
+            events,
+            metrics,
+            spawn_counts: (0..n_threads)
+                .map(|_| CachePadded::new(SpawnCounters::new()))
+                .collect(),
         }
     }
 
     #[inline]
-    pub(super) fn start_looking(&self, worker_index: usize) -> IdleState {
+    fn should_emit(&self, kind: WorkerStateKind) -> bool {
+        self.metrics.is_some() && self.events.contains(kind)
+    }
+
+    #[inline]
+    pub(super) fn record_spawn(&self, worker_index: usize, kind: SpawnKind) {
+        let counters = &self.spawn_counts[worker_index];
+        match kind {
+            SpawnKind::Lifo => {
+                counters.lifo.fetch_add(1, Ordering::Relaxed);
+            }
+            SpawnKind::Fifo => {
+                counters.fifo.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    fn report(
+        &self,
+        worker_index: usize,
+        kind: WorkerStateKind,
+        local_queue_depth: Option<usize>,
+        global_queue_depth: Option<usize>,
+        search_latency: Option<Duration>,
+        sleep_duration: Option<Duration>,
+    ) {
+        let Some(recorder) = &self.metrics else {
+            return;
+        };
+
+        if !self.events.contains(kind) {
+            return;
+        }
+
+        let counters = self.counters.load(Ordering::SeqCst);
+        let event = WorkerStateEvent {
+            pool_id: self.pool_id,
+            worker_index,
+            kind,
+            ts: Instant::now(),
+            inactive_threads: counters.inactive_threads(),
+            sleeping_threads: counters.sleeping_threads(),
+            awake_but_idle_threads: counters.awake_but_idle_threads(),
+            local_queue_depth,
+            global_queue_depth,
+            lifo_spawn_count: self.spawn_counts[worker_index].lifo.load(Ordering::Relaxed),
+            fifo_spawn_count: self.spawn_counts[worker_index].fifo.load(Ordering::Relaxed),
+            search_latency,
+            sleep_duration,
+        };
+
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| recorder.worker_event(event)));
+    }
+
+    #[inline]
+    pub(super) fn start_looking(
+        &self,
+        worker_index: usize,
+        local_queue_depth: Option<usize>,
+        global_queue_depth: Option<usize>,
+    ) -> IdleState {
         self.counters.add_inactive_thread();
+        self.report(
+            worker_index,
+            WorkerStateKind::StartLooking,
+            local_queue_depth,
+            global_queue_depth,
+            None,
+            None,
+        );
 
         IdleState {
             worker_index,
             rounds: 0,
             jobs_counter: JobsEventCounter::DUMMY,
+            search_started_at: Instant::now(),
         }
     }
 
     #[inline]
-    pub(super) fn work_found(&self) {
+    pub(super) fn work_found(
+        &self,
+        idle_state: &mut IdleState,
+        local_queue_depth: Option<usize>,
+        global_queue_depth: Option<usize>,
+    ) {
+        let worker_index = idle_state.worker_index;
         // If we were the last idle thread and other threads are still sleeping,
-        // then we should wake up another thread.
-        let threads_to_wake = self.counters.sub_inactive_thread();
-        self.wake_any_threads(threads_to_wake as u32);
+        // then we should wake up another thread. Do so before we clear our
+        // inactive slot so observers never see `sleeping > inactive`.
+        let sleepers = self.counters.load(Ordering::SeqCst).sleeping_threads();
+        let to_wake = sleepers.min(2);
+        if to_wake > 0 {
+            self.wake_any_threads(to_wake as u32);
+        }
+
+        // Now mark this worker as active again.
+        let _ = self.counters.sub_inactive_thread();
+        let search_latency = if self.should_emit(WorkerStateKind::WorkFound) {
+            Some(idle_state.search_started_at.elapsed())
+        } else {
+            None
+        };
+        self.report(
+            worker_index,
+            WorkerStateKind::WorkFound,
+            local_queue_depth,
+            global_queue_depth,
+            search_latency,
+            None,
+        );
+        idle_state.search_started_at = Instant::now();
     }
 
     #[inline]
@@ -97,6 +239,14 @@ impl Sleep {
         } else if idle_state.rounds == ROUNDS_UNTIL_SLEEPY {
             idle_state.jobs_counter = self.announce_sleepy();
             idle_state.rounds += 1;
+            self.report(
+                idle_state.worker_index,
+                WorkerStateKind::Sleepy,
+                None,
+                None,
+                None,
+                None,
+            );
             thread::yield_now();
         } else if idle_state.rounds < ROUNDS_UNTIL_SLEEPING {
             idle_state.rounds += 1;
@@ -169,6 +319,7 @@ impl Sleep {
         // - we are the last active worker thread
         std::sync::atomic::fence(Ordering::SeqCst);
         if has_injected_jobs() {
+            drop(is_blocked);
             // If we see an externally injected job, then we have to 'wake
             // ourselves up'. (Ordinarily, `sub_sleeping_thread` is invoked by
             // the one that wakes us.)
@@ -183,9 +334,37 @@ impl Sleep {
             // release the mutex in the call to `wait`, so they will see this
             // boolean as true.)
             *is_blocked = true;
+            drop(is_blocked);
+            let resume_timer = if self.should_emit(WorkerStateKind::Resumed) {
+                Some(Instant::now())
+            } else {
+                None
+            };
+
+            self.report(
+                worker_index,
+                WorkerStateKind::Sleeping,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            let mut is_blocked = sleep_state.is_blocked.lock().unwrap();
             while *is_blocked {
                 is_blocked = sleep_state.condvar.wait(is_blocked).unwrap();
             }
+            drop(is_blocked);
+
+            let sleep_duration = resume_timer.map(|start| start.elapsed());
+            self.report(
+                worker_index,
+                WorkerStateKind::Resumed,
+                None,
+                None,
+                None,
+                sleep_duration,
+            );
         }
 
         // Update other state:
@@ -288,21 +467,25 @@ impl Sleep {
     fn wake_specific_thread(&self, index: usize) -> bool {
         let sleep_state = &self.worker_sleep_states[index];
 
-        let mut is_blocked = sleep_state.is_blocked.lock().unwrap();
-        if *is_blocked {
-            *is_blocked = false;
+        let should_wake = {
+            let mut is_blocked = sleep_state.is_blocked.lock().unwrap();
+            if *is_blocked {
+                *is_blocked = false;
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_wake {
+            // When the thread went to sleep, it will have incremented this
+            // value. Adjust it before notifying so observers never see more
+            // sleepers than inactive threads.
+            self.counters.sub_sleeping_thread();
+
             sleep_state.condvar.notify_one();
 
-            // When the thread went to sleep, it will have incremented
-            // this value. When we wake it, its our job to decrement
-            // it. We could have the thread do it, but that would
-            // introduce a delay between when the thread was
-            // *notified* and when this counter was decremented. That
-            // might mislead people with new work into thinking that
-            // there are sleeping threads that they should try to
-            // wake, when in fact there is nothing left for them to
-            // do.
-            self.counters.sub_sleeping_thread();
+            self.report(index, WorkerStateKind::Woken, None, None, None, None);
 
             true
         } else {
@@ -315,10 +498,12 @@ impl IdleState {
     fn wake_fully(&mut self) {
         self.rounds = 0;
         self.jobs_counter = JobsEventCounter::DUMMY;
+        self.search_started_at = Instant::now();
     }
 
     fn wake_partly(&mut self) {
         self.rounds = ROUNDS_UNTIL_SLEEPY;
         self.jobs_counter = JobsEventCounter::DUMMY;
+        self.search_started_at = Instant::now();
     }
 }
